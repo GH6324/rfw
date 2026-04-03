@@ -5,25 +5,13 @@ use clap::{Parser, Subcommand};
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use rfw_common::{PortAccessKey, PortAccessStats};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use tokio::signal;
 
-// GeoIP 数据JSON结构
-#[derive(Debug, Deserialize)]
-struct GeoIpData {
-    rules: Vec<GeoIpRule>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GeoIpRule {
-    ip_cidr: Vec<String>,
-}
-
 // 从 URL 下载并解析指定国家的 GeoIP 数据
-async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<GeoIpData> {
-    const GEOIP_URL_TEMPLATE: &str = "https://raw.githubusercontent.com/lyc8503/sing-box-rules/refs/heads/rule-set-geoip/geoip-{}.json";
+async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<Vec<String>> {
+    const GEOIP_URL_TEMPLATE: &str = "https://raw.githubusercontent.com/Loyalsoldier/geoip/refs/heads/release/text/{}.txt";
 
     let url = GEOIP_URL_TEMPLATE.replace("{}", &country_code.to_lowercase());
     info!(
@@ -46,23 +34,26 @@ async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<GeoIpData> {
         );
     }
 
-    let geo_data: GeoIpData = response.json().await?;
+    let text = response.text().await?;
+    let cidrs: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
 
-    // 统计总的 CIDR 条目数
-    let total_cidrs: usize = geo_data.rules.iter().map(|r| r.ip_cidr.len()).sum();
     info!(
         "成功下载并解析 {} 的 {} 个 IP CIDR 前缀",
         country_code.to_uppercase(),
-        total_cidrs
+        cidrs.len()
     );
 
-    Ok(geo_data)
+    Ok(cidrs)
 }
 
 // 批量下载多个国家的 GeoIP 数据
 async fn fetch_multiple_geoip_data(
     country_codes: &[String],
-) -> anyhow::Result<Vec<(String, GeoIpData)>> {
+) -> anyhow::Result<Vec<(String, Vec<String>)>> {
     let mut results = Vec::new();
 
     for code in country_codes {
@@ -640,13 +631,12 @@ async fn run_firewall(opt: RunOpt) -> anyhow::Result<()> {
         let mut insert_errors = 0;
 
         // 处理所有国家的数据
-        for (country_code, geo_data) in geo_data_list {
+        for (country_code, cidrs) in geo_data_list {
             info!("正在加载 {} 的 IP 前缀...", country_code);
 
-            for rule in &geo_data.rules {
-                for cidr in &rule.ip_cidr {
-                    // 解析 CIDR（如 "1.0.1.0/24"）
-                    if let Some((ip, prefix_len)) = parse_cidr_to_lpm(cidr) {
+            for cidr in &cidrs {
+                // 解析 CIDR（如 "1.0.1.0/24"）
+                if let Some((ip, prefix_len)) = parse_cidr_to_lpm(cidr) {
                         // 构造 LpmTrie Key
                         // 注意：IP地址必须转换为网络字节序（大端）
                         let key = aya::maps::lpm_trie::Key::new(prefix_len, ip.to_be());
@@ -667,7 +657,6 @@ async fn run_firewall(opt: RunOpt) -> anyhow::Result<()> {
                         }
                     }
                 }
-            }
 
             info!("已加载 {} 的 IP 前缀", country_code);
         }
